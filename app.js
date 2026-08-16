@@ -120,7 +120,7 @@ const views = {
   },
   orders: {
     title: "ใบสั่งของ",
-    render: () => renderPlaceholder("ใบสั่งของ", "พื้นที่ตัวอย่างสำหรับเมนูใบสั่งของ ยังไม่มีข้อมูลหรือ logic จริง"),
+    render: renderShipmentView,
   },
   products: {
     title: "สินค้า",
@@ -128,16 +128,13 @@ const views = {
   },
   stock: {
     title: "สต๊อก",
-    render: () => renderPlaceholder("สต๊อก", "พื้นที่ตัวอย่างสำหรับเมนูสต๊อก ยังไม่มีการเชื่อมต่อคลังสินค้า"),
+    render: renderStockView,
   },
   more: {
     title: "เพิ่มเติม",
-    render: () => renderPlaceholder("เพิ่มเติม", "พื้นที่ตัวอย่างสำหรับเมนูเพิ่มเติม ยังไม่มีการตั้งค่าระบบ"),
+    render: () => renderPlaceholder("เพิ่มเติม", "ยังไม่มีเมนูเพิ่มเติม"),
   },
 };
-
-views.orders.render = renderShipmentView;
-views.stock.render = renderStockView;
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -432,24 +429,25 @@ function validateRuntimeConfig() {
 
 function applyEnvironmentUi() {
   const label = runtimeEnvironmentLabel();
+  const environmentName = runtimeEnvironment() === "PRODUCTION" ? "ระบบใช้งานจริง" : "ระบบทดสอบ";
   document.documentElement.dataset.stockAdminEnvironment = runtimeEnvironment();
   environmentStrips.forEach((strip) => {
-    strip.textContent = `${label} ENVIRONMENT`;
+    strip.textContent = environmentName;
   });
   if (environmentBadge) {
     environmentBadge.textContent = label;
     environmentBadge.classList.toggle("is-hidden", runtimeEnvironment() === "PRODUCTION");
   }
   if (loginCopy) {
-    loginCopy.textContent = `เข้าสู่ระบบ ${label} ด้วยบัญชีที่ได้รับอนุญาต`;
+    loginCopy.textContent = "เข้าสู่ระบบด้วยบัญชีที่ได้รับอนุญาต";
   }
   if (mockNote) {
     mockNote.textContent = runtimeEnvironment() === "PRODUCTION"
-      ? "Production UI นี้ต้องเชื่อมต่อ Production Backend เท่านั้น"
-      : "TEST UI นี้เชื่อมต่อ TEST Auth Backend เท่านั้น และไม่ใช่ Production";
+      ? "กำลังใช้งานระบบจริง ข้อมูลในระบบนี้เป็นข้อมูลจริง"
+      : "กำลังใช้งานระบบทดสอบ ข้อมูลนี้ไม่ใช่ข้อมูลจริง";
   }
-  loginButton.textContent = `เข้าสู่ระบบ ${label}`;
-  appShell.setAttribute("aria-label", `${label} app shell`);
+  loginButton.textContent = "เข้าสู่ระบบ";
+  appShell.setAttribute("aria-label", environmentName);
 }
 
 function renderHome() {
@@ -457,16 +455,16 @@ function renderHome() {
 
   const search = document.createElement("div");
   search.className = "search-box";
-  search.textContent = "ค้นหาแบบตัวอย่าง";
+  search.textContent = "เลือกงานที่ต้องการทำ";
   fragment.append(search);
 
   const shortcuts = document.createElement("section");
   shortcuts.className = "shortcut-grid";
   shortcuts.append(
-    createShortcut("รับเข้า", "Placeholder"),
-    createShortcut("จ่ายออก", "Placeholder"),
-    createShortcut("ตรวจนับ", "Placeholder"),
-    createShortcut("รายงาน", "Placeholder"),
+    createShortcut("รับเข้า", "ไปที่หน้าสต๊อก", "stock"),
+    createShortcut("จ่ายออก", "ไปที่หน้าใบสั่งของ", "orders"),
+    createShortcut("ตรวจนับ", "ไปที่หน้าสต๊อก", "stock"),
+    createShortcut("รายงาน", "ยังไม่เปิดใช้งาน"),
   );
   fragment.append(shortcuts);
 
@@ -474,7 +472,7 @@ function renderHome() {
   pending.className = "card";
   pending.innerHTML = `
     <h2>งานรอดำเนินการ</h2>
-    <p class="placeholder-text">โครงหน้าจอสำหรับรายการงาน ยังไม่มีข้อมูลจริง</p>
+    <p class="placeholder-text">ฟีเจอร์นี้ยังไม่เปิดใช้งาน</p>
   `;
   fragment.append(pending);
 
@@ -482,11 +480,7 @@ function renderHome() {
   summary.className = "card";
   summary.innerHTML = `
     <h2>สรุปภาพรวม</h2>
-    <div class="summary-row" aria-label="ข้อมูลตัวอย่าง">
-      <div class="summary-item"><strong>-</strong><span>คำสั่งซื้อ</span></div>
-      <div class="summary-item"><strong>-</strong><span>สินค้า</span></div>
-      <div class="summary-item"><strong>-</strong><span>สต๊อก</span></div>
-    </div>
+    <p class="placeholder-text">ยังไม่มีข้อมูลภาพรวม</p>
   `;
   fragment.append(summary);
 
@@ -4033,10 +4027,21 @@ function clearElement(element) {
   }
 }
 
-function createShortcut(title, detail) {
+function createShortcut(title, detail, viewName) {
   const item = document.createElement("article");
   item.className = "card shortcut";
   item.innerHTML = `<strong>${title}</strong><span class="placeholder-text">${detail}</span>`;
+  if (viewName) {
+    item.setAttribute("role", "button");
+    item.tabIndex = 0;
+    item.addEventListener("click", () => setView(viewName));
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        setView(viewName);
+      }
+    });
+  }
   return item;
 }
 
