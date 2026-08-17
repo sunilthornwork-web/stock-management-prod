@@ -109,6 +109,9 @@ const productCreateState = {
   submitting: false,
   message: "",
   messageType: "info",
+  selectedImageFile: null,
+  imagePreviewUrl: "",
+  imagePreviewError: "",
 };
 const productEditState = createEmptyProductEditState();
 const shipmentCreateState = {
@@ -800,6 +803,8 @@ function renderCreateProductForm() {
     }),
   );
 
+  form.append(renderProductCreateImageSection());
+
   const skuHeader = document.createElement("div");
   skuHeader.className = "create-section-header";
   const skuTitle = document.createElement("h3");
@@ -838,6 +843,62 @@ function renderCreateProductForm() {
   form.append(actions);
 
   return form;
+}
+
+function renderProductCreateImageSection() {
+  const section = document.createElement("section");
+  section.className = "product-edit-section product-edit-image-section product-create-image-section";
+  const title = document.createElement("h3");
+  title.textContent = "รูปสินค้า";
+  section.append(title);
+
+  const preview = document.createElement("div");
+  preview.className = "product-edit-image-preview";
+  if (productCreateState.imagePreviewUrl) {
+    const image = document.createElement("img");
+    image.src = productCreateState.imagePreviewUrl;
+    image.alt = "รูปสินค้าที่เลือก";
+    preview.append(image);
+  } else {
+    const placeholder = document.createElement("p");
+    placeholder.textContent = "ไม่มีรูป";
+    preview.append(placeholder);
+  }
+  section.append(preview);
+
+  if (productCreateState.imagePreviewError) {
+    const error = document.createElement("p");
+    error.className = "product-status product-error";
+    error.textContent = productCreateState.imagePreviewError;
+    section.append(error);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "product-edit-image-actions";
+  const fileLabel = document.createElement("label");
+  fileLabel.className = "secondary-action-button product-edit-file-button";
+  fileLabel.textContent = "เลือกรูป";
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/jpeg,image/png";
+  input.addEventListener("change", (event) => handleProductCreateImageSelection(event.target.files));
+  fileLabel.append(input);
+  actions.append(fileLabel);
+
+  if (productCreateState.selectedImageFile) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "secondary-action-button";
+    clear.textContent = "ยกเลิกการเลือกรูป";
+    clear.addEventListener("click", () => {
+      clearProductCreateSelectedImage();
+      rerenderProductView();
+    });
+    actions.append(clear);
+  }
+
+  section.append(actions);
+  return section;
 }
 
 function renderSkuFormCard(sku, index) {
@@ -929,6 +990,7 @@ function renderCreateProductReview() {
     createReviewLine("ชื่อสินค้า", productCreateState.form.product_name),
     createReviewLine("หมวดหมู่", productCreateState.form.category || "-"),
     createReviewLine("จำนวน SKU", productCreateState.form.skus.length),
+    createReviewLine("รูปสินค้า", productCreateState.selectedImageFile ? "เพิ่มรูป" : "ไม่มีรูป"),
   );
   review.append(productSummary);
 
@@ -1068,13 +1130,30 @@ async function submitCreateProduct() {
       sessionToken: requireSessionToken(),
       product: createProductPayloadFromForm(),
     });
-    requireSuccess(response);
+    const result = requireSuccess(response);
+    const productId = String(result.productId || "").trim();
+    let imageAttachFailed = false;
+    if (productCreateState.selectedImageFile) {
+      if (!productId) {
+        throw new Error("BACKEND_RESPONSE_INVALID");
+      }
+      try {
+        await submitProductCreateImage(productId);
+      } catch (imageError) {
+        imageAttachFailed = true;
+      }
+    }
+
     resetCreateProductState();
-    productCreateState.message = "เพิ่มสินค้าสำเร็จ";
+    productCreateState.message = imageAttachFailed
+      ? "เพิ่มสินค้าสำเร็จ แต่บันทึกรูปไม่สำเร็จ กรุณาเข้าแก้ไขสินค้าเพื่อเพิ่มรูปอีกครั้ง"
+      : "เพิ่มสินค้าสำเร็จ";
     productCreateState.messageType = "info";
     productState.initialized = false;
     await loadProducts({ reset: true });
-    productCreateState.message = "เพิ่มสินค้าสำเร็จ";
+    productCreateState.message = imageAttachFailed
+      ? "เพิ่มสินค้าสำเร็จ แต่บันทึกรูปไม่สำเร็จ กรุณาเข้าแก้ไขสินค้าเพื่อเพิ่มรูปอีกครั้ง"
+      : "เพิ่มสินค้าสำเร็จ";
     rerenderProductView();
   } catch (error) {
     if (handleProductAuthFailure(error)) {
@@ -1129,6 +1208,15 @@ function validateCreateProductForm() {
       errors.push(`${label}: จำนวนเริ่มต้นต้องเป็นจำนวนเต็มตั้งแต่ 0 ขึ้นไป`);
     }
   });
+
+  if (productCreateState.selectedImageFile) {
+    if (!PRODUCT_IMAGE_MIME_TYPES.includes(productCreateState.selectedImageFile.type)) {
+      errors.push("รองรับเฉพาะไฟล์ JPEG หรือ PNG");
+    }
+    if (productCreateState.selectedImageFile.size > PRODUCT_IMAGE_MAX_BYTES) {
+      errors.push("รูปต้องมีขนาดไม่เกิน 2 MB");
+    }
+  }
 
   return errors;
 }
@@ -1187,12 +1275,71 @@ function createEmptySkuForm() {
 }
 
 function resetCreateProductState() {
+  revokeProductCreateImagePreview();
   productCreateState.mode = "list";
   productCreateState.form = createEmptyProductForm();
   productCreateState.errors = [];
   productCreateState.submitting = false;
   productCreateState.message = "";
   productCreateState.messageType = "info";
+  productCreateState.selectedImageFile = null;
+  productCreateState.imagePreviewUrl = "";
+  productCreateState.imagePreviewError = "";
+}
+
+function handleProductCreateImageSelection(files) {
+  productCreateState.imagePreviewError = "";
+  const file = files && files[0] ? files[0] : null;
+  if (!file) {
+    return;
+  }
+
+  clearProductCreateSelectedImage();
+
+  if (!PRODUCT_IMAGE_MIME_TYPES.includes(file.type)) {
+    productCreateState.imagePreviewError = "รองรับเฉพาะไฟล์ JPEG หรือ PNG";
+    rerenderProductView();
+    return;
+  }
+
+  if (file.size > PRODUCT_IMAGE_MAX_BYTES) {
+    productCreateState.imagePreviewError = "รูปต้องมีขนาดไม่เกิน 2 MB";
+    rerenderProductView();
+    return;
+  }
+
+  productCreateState.selectedImageFile = file;
+  try {
+    productCreateState.imagePreviewUrl = URL.createObjectURL(file);
+  } catch (error) {
+    productCreateState.imagePreviewError = "แสดงตัวอย่างรูปไม่ได้ แต่ยังสามารถลองบันทึกได้";
+  }
+  rerenderProductView();
+}
+
+function clearProductCreateSelectedImage() {
+  revokeProductCreateImagePreview();
+  productCreateState.selectedImageFile = null;
+  productCreateState.imagePreviewUrl = "";
+  productCreateState.imagePreviewError = "";
+}
+
+function revokeProductCreateImagePreview() {
+  if (productCreateState.imagePreviewUrl) {
+    URL.revokeObjectURL(productCreateState.imagePreviewUrl);
+  }
+}
+
+async function submitProductCreateImage(productId) {
+  const file = productCreateState.selectedImageFile;
+  const response = await callAuthApi("attachProductImage", {
+    sessionToken: requireSessionToken(),
+    productId,
+    fileName: file.name,
+    mimeType: file.type,
+    contentBase64: await fileToBase64(file),
+  });
+  requireSuccess(response);
 }
 
 function createEmptyProductEditState() {
