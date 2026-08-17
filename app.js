@@ -31,8 +31,11 @@ const STOCK_PAGE_SIZE = 20;
 const SHIPMENT_PAGE_SIZE = 20;
 const OWNER_ROLE = "OWNER";
 const ADMIN_ROLE = "ADMIN";
+const MANAGE_PRODUCTS_PERMISSION = "MANAGE_PRODUCTS";
 const ADJUST_STOCK_PERMISSION = "ADJUST_STOCK";
 const CONFIRM_SHIPMENT_PERMISSION = "CONFIRM_SHIPMENT";
+const PRODUCT_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const PRODUCT_IMAGE_MIME_TYPES = ["image/jpeg", "image/png"];
 
 let currentUser = null;
 let activeViewName = "home";
@@ -57,6 +60,7 @@ const productState = {
   detailTransition: "",
   listScrollTop: 0,
   requestId: 0,
+  detailRequestId: 0,
 };
 const stockState = {
   initialized: false,
@@ -106,6 +110,7 @@ const productCreateState = {
   message: "",
   messageType: "info",
 };
+const productEditState = createEmptyProductEditState();
 const shipmentCreateState = {
   mode: "list",
   form: createEmptyShipmentForm(),
@@ -663,9 +668,65 @@ function openProductDetail(product) {
   productState.listScrollTop = getProductScrollTop();
   productState.detail = product;
   productState.detailError = "";
-  productState.detailLoading = false;
+  productState.detailLoading = true;
   productState.detailTransition = "enter";
+  resetProductEditState();
   rerenderProductView();
+  refreshProductDetail(product.productId, { showLoading: true });
+}
+
+async function refreshProductDetail(productId, options) {
+  const normalizedProductId = String(productId || "").trim();
+  if (!normalizedProductId) {
+    return;
+  }
+
+  const requestId = productState.detailRequestId + 1;
+  productState.detailRequestId = requestId;
+
+  if (options && options.showLoading) {
+    productState.detailLoading = true;
+    productState.detailError = "";
+    rerenderProductView();
+  }
+
+  try {
+    const response = await callAuthApi("getProductDetail", {
+      sessionToken: requireSessionToken(),
+      productId: normalizedProductId,
+    });
+    const detail = requireSuccess(response);
+    if (requestId !== productState.detailRequestId) {
+      return;
+    }
+
+    productState.detail = detail;
+    productState.detailError = "";
+    updateProductListItem(detail);
+  } catch (error) {
+    if (handleProductAuthFailure(error)) {
+      return;
+    }
+    if (requestId === productState.detailRequestId) {
+      productState.detailError = toThaiErrorMessage(error);
+    }
+  } finally {
+    if (requestId === productState.detailRequestId) {
+      productState.detailLoading = false;
+      rerenderProductView();
+    }
+  }
+}
+
+function updateProductListItem(product) {
+  if (!product || !product.productId) {
+    return;
+  }
+
+  const index = productState.items.findIndex((item) => item.productId === product.productId);
+  if (index !== -1) {
+    productState.items[index] = product;
+  }
 }
 
 function renderCreateProductFlow() {
@@ -725,6 +786,9 @@ function renderCreateProductForm() {
   form.append(title, note);
 
   form.append(
+    createTextField("product_code", "รหัสสินค้า", productCreateState.form.product_code, true, (value) => {
+      productCreateState.form.product_code = value;
+    }),
     createTextField("product_name", "ชื่อสินค้า", productCreateState.form.product_name, true, (value) => {
       productCreateState.form.product_name = value;
     }),
@@ -861,6 +925,7 @@ function renderCreateProductReview() {
   const productSummary = document.createElement("div");
   productSummary.className = "review-summary";
   productSummary.append(
+    createReviewLine("รหัสสินค้า", normalizeProductCodeForUi(productCreateState.form.product_code)),
     createReviewLine("ชื่อสินค้า", productCreateState.form.product_name),
     createReviewLine("หมวดหมู่", productCreateState.form.category || "-"),
     createReviewLine("จำนวน SKU", productCreateState.form.skus.length),
@@ -1025,6 +1090,10 @@ async function submitCreateProduct() {
 function validateCreateProductForm() {
   const errors = [];
   const form = productCreateState.form;
+  if (!normalizeProductCodeForUi(form.product_code)) {
+    errors.push("กรุณากรอกรหัสสินค้า");
+  }
+
   if (!String(form.product_name || "").trim()) {
     errors.push("กรุณากรอกชื่อสินค้า");
   }
@@ -1066,6 +1135,7 @@ function validateCreateProductForm() {
 
 function createProductPayloadFromForm() {
   return {
+    product_code: normalizeProductCodeForUi(productCreateState.form.product_code),
     product_name: String(productCreateState.form.product_name || "").trim(),
     category: String(productCreateState.form.category || "").trim(),
     description: String(productCreateState.form.description || "").trim(),
@@ -1095,6 +1165,7 @@ function createReviewLine(label, value) {
 
 function createEmptyProductForm() {
   return {
+    product_code: "",
     product_name: "",
     category: "",
     description: "",
@@ -1124,6 +1195,852 @@ function resetCreateProductState() {
   productCreateState.messageType = "info";
 }
 
+function createEmptyProductEditState() {
+  return {
+    mode: "view",
+    original: null,
+    form: null,
+    errors: [],
+    submitting: false,
+    message: "",
+    messageType: "info",
+    expandedSkuId: "",
+    selectedImageFile: null,
+    imagePreviewUrl: "",
+    imagePreviewError: "",
+    removeImage: false,
+  };
+}
+
+function resetProductEditState() {
+  revokeProductEditImagePreview();
+  productEditState.mode = "view";
+  productEditState.original = null;
+  productEditState.form = null;
+  productEditState.errors = [];
+  productEditState.submitting = false;
+  productEditState.message = "";
+  productEditState.messageType = "info";
+  productEditState.expandedSkuId = "";
+  productEditState.selectedImageFile = null;
+  productEditState.imagePreviewUrl = "";
+  productEditState.imagePreviewError = "";
+  productEditState.removeImage = false;
+}
+
+function openProductEditCenter(product) {
+  productEditState.original = createProductEditSnapshot(product);
+  productEditState.form = createProductEditSnapshot(product);
+  productEditState.mode = "form";
+  productEditState.errors = [];
+  productEditState.message = "";
+  productEditState.messageType = "info";
+  productEditState.expandedSkuId = productEditState.form.skus[0] ? productEditState.form.skus[0].skuId : "";
+  productEditState.removeImage = false;
+  revokeProductEditImagePreview();
+  rerenderProductView();
+}
+
+function createProductEditSnapshot(product) {
+  const skus = Array.isArray(product && product.skus) ? product.skus : [];
+  return {
+    productId: product && product.productId ? product.productId : "",
+    productCode: product && product.productCode ? product.productCode : "",
+    productName: product && product.productName ? product.productName : "",
+    category: product && product.category ? product.category : "",
+    description: product && product.description ? product.description : "",
+    hasImage: !!(product && product.hasImage),
+    imageUrl: product && product.imageUrl ? product.imageUrl : "",
+    skus: skus.map((sku) => ({
+      skuId: sku.skuId || "",
+      skuCode: sku.skuCode || "",
+      model: sku.model || "",
+      color: sku.color || "",
+      size: sku.size || "",
+      costPrice: productEditNumberInputValue(sku.costPrice),
+      salePrice: productEditNumberInputValue(sku.salePrice),
+      sourceableQtyEstimate: productEditNumberInputValue(sku.sourceableQtyEstimate),
+      onHandQty: sku.onHandQty,
+    })),
+  };
+}
+
+function renderProductEditCenter() {
+  const card = document.createElement("section");
+  card.className = "card product-detail-card product-edit-card";
+
+  if (!productEditState.form || !productEditState.original) {
+    const message = document.createElement("p");
+    message.className = "product-status product-error";
+    message.textContent = "ไม่สามารถเปิดฟอร์มแก้ไขสินค้าได้";
+    card.append(message);
+    return card;
+  }
+
+  if (productEditState.message) {
+    const message = document.createElement("p");
+    message.className = "product-status create-product-message";
+    message.dataset.type = productEditState.messageType;
+    message.textContent = productEditState.message;
+    card.append(message);
+  }
+
+  if (productEditState.errors.length > 0) {
+    card.append(renderProductEditErrors());
+  }
+
+  card.append(productEditState.mode === "review"
+    ? renderProductEditReview()
+    : renderProductEditForm());
+  return card;
+}
+
+function renderProductEditErrors() {
+  const errorBox = document.createElement("section");
+  errorBox.className = "create-error-list";
+  const title = document.createElement("h2");
+  title.textContent = "ตรวจสอบข้อมูล";
+  const list = document.createElement("ul");
+  productEditState.errors.forEach((error) => {
+    const item = document.createElement("li");
+    item.textContent = error;
+    list.append(item);
+  });
+  errorBox.append(title, list);
+  return errorBox;
+}
+
+function renderProductEditForm() {
+  const form = document.createElement("form");
+  form.className = "create-product-form product-edit-form";
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    openProductEditReview();
+  });
+  form.addEventListener("input", () => {
+    updateProductEditReviewButtonState(form);
+  });
+
+  const header = document.createElement("div");
+  header.className = "product-edit-title-row";
+  const titleWrap = document.createElement("div");
+  const title = document.createElement("h2");
+  title.textContent = "แก้ไขสินค้า";
+  const note = document.createElement("p");
+  note.className = "placeholder-text";
+  note.textContent = "แก้ข้อมูลสินค้าและ SKU โดยไม่เปลี่ยนจำนวน Stock";
+  titleWrap.append(title, note);
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "detail-close-button";
+  close.textContent = "ยกเลิก";
+  close.disabled = productEditState.submitting;
+  close.addEventListener("click", cancelProductEditCenter);
+  header.append(titleWrap, close);
+  form.append(header);
+
+  form.append(renderProductEditProductSection());
+  form.append(renderProductEditImageSection());
+  form.append(renderProductEditSkuSection());
+
+  const actions = document.createElement("div");
+  actions.className = "create-form-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "secondary-action-button";
+  cancel.textContent = "ยกเลิก";
+  cancel.disabled = productEditState.submitting;
+  cancel.addEventListener("click", cancelProductEditCenter);
+  const review = document.createElement("button");
+  review.type = "submit";
+  review.className = "primary-action-button";
+  review.classList.add("product-edit-review-button");
+  updateProductEditReviewButtonState(form, review);
+  actions.append(cancel, review);
+  form.append(actions);
+
+  return form;
+}
+
+function updateProductEditReviewButtonState(form, button) {
+  const reviewButton = button || (form ? form.querySelector(".product-edit-review-button") : null);
+  if (!reviewButton) {
+    return;
+  }
+
+  const hasChanges = productEditHasAnyChanges();
+  reviewButton.textContent = hasChanges ? "ตรวจสอบก่อนบันทึก" : "ไม่มีการเปลี่ยนแปลง";
+  reviewButton.disabled = productEditState.submitting || !hasChanges;
+}
+
+function renderProductEditProductSection() {
+  const section = document.createElement("section");
+  section.className = "product-edit-section";
+  const title = document.createElement("h3");
+  title.textContent = "ข้อมูลสินค้า";
+  section.append(title);
+
+  const form = productEditState.form;
+  section.append(
+    createTextField("edit_product_code", "รหัสสินค้า", form.productCode, true, (value) => {
+      form.productCode = value;
+    }),
+    createTextField("edit_product_name", "ชื่อสินค้า", form.productName, true, (value) => {
+      form.productName = value;
+    }),
+    createTextField("edit_category", "หมวดหมู่", form.category, false, (value) => {
+      form.category = value;
+    }),
+    createTextAreaField("edit_description", "รายละเอียด", form.description, (value) => {
+      form.description = value;
+    }),
+  );
+  return section;
+}
+
+function renderProductEditImageSection() {
+  const section = document.createElement("section");
+  section.className = "product-edit-section product-edit-image-section";
+  const title = document.createElement("h3");
+  title.textContent = "รูปสินค้า";
+  section.append(title);
+
+  const preview = document.createElement("div");
+  preview.className = "product-edit-image-preview";
+  const currentImageUrl = productEditState.original.imageUrl;
+  if (productEditState.imagePreviewUrl) {
+    const image = document.createElement("img");
+    image.src = productEditState.imagePreviewUrl;
+    image.alt = "รูปใหม่ที่เลือก";
+    preview.append(image);
+  } else if (productEditState.removeImage) {
+    const placeholder = document.createElement("p");
+    placeholder.textContent = "จะลบรูปสินค้า";
+    preview.append(placeholder);
+  } else if (productEditState.original.hasImage && currentImageUrl) {
+    const image = document.createElement("img");
+    image.src = currentImageUrl;
+    image.alt = productEditState.form.productName || "รูปสินค้า";
+    preview.append(image);
+  } else {
+    const placeholder = document.createElement("p");
+    placeholder.textContent = "ไม่มีรูป";
+    preview.append(placeholder);
+  }
+  section.append(preview);
+
+  if (productEditState.imagePreviewError) {
+    const error = document.createElement("p");
+    error.className = "product-status product-error";
+    error.textContent = productEditState.imagePreviewError;
+    section.append(error);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "product-edit-image-actions";
+  const fileLabel = document.createElement("label");
+  fileLabel.className = "secondary-action-button product-edit-file-button";
+  fileLabel.textContent = productEditState.original.hasImage ? "เปลี่ยนรูป" : "เพิ่มรูป";
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/jpeg,image/png";
+  input.addEventListener("change", (event) => handleProductEditImageSelection(event.target.files));
+  fileLabel.append(input);
+  actions.append(fileLabel);
+
+  if (productEditState.selectedImageFile) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "secondary-action-button";
+    clear.textContent = "ยกเลิกการเลือกรูปใหม่";
+    clear.addEventListener("click", () => {
+      clearProductEditSelectedImage();
+      rerenderProductView();
+    });
+    actions.append(clear);
+  }
+
+  if (productEditState.original.hasImage && !productEditState.selectedImageFile) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = productEditState.removeImage ? "secondary-action-button" : "danger-action-button";
+    remove.textContent = productEditState.removeImage ? "ยกเลิกลบรูป" : "ลบรูป";
+    remove.addEventListener("click", () => {
+      productEditState.removeImage = !productEditState.removeImage;
+      productEditState.imagePreviewError = "";
+      rerenderProductView();
+    });
+    actions.append(remove);
+  }
+
+  section.append(actions);
+  return section;
+}
+
+function renderProductEditSkuSection() {
+  const section = document.createElement("section");
+  section.className = "product-edit-section";
+  const header = document.createElement("div");
+  header.className = "create-section-header";
+  const title = document.createElement("h3");
+  title.textContent = "SKU / Variant";
+  const count = document.createElement("span");
+  count.className = "placeholder-text";
+  count.textContent = `${productEditState.form.skus.length} รายการ`;
+  header.append(title, count);
+  section.append(header);
+
+  const list = document.createElement("div");
+  list.className = "product-edit-sku-list";
+  productEditState.form.skus.forEach((sku, index) => {
+    list.append(renderProductEditSkuCard(sku, index));
+  });
+  section.append(list);
+  return section;
+}
+
+function renderProductEditSkuCard(sku, index) {
+  const original = productEditState.original.skus.find((item) => item.skuId === sku.skuId) || {};
+  const details = document.createElement("details");
+  details.className = "product-edit-sku-card";
+  details.open = productEditState.expandedSkuId === sku.skuId || index === 0 && !productEditState.expandedSkuId;
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      productEditState.expandedSkuId = sku.skuId;
+    }
+  });
+
+  const summary = document.createElement("summary");
+  const summaryText = document.createElement("span");
+  summaryText.className = "product-edit-sku-summary";
+  const code = document.createElement("strong");
+  code.textContent = sku.skuCode || `SKU #${index + 1}`;
+  const meta = document.createElement("span");
+  meta.textContent = [sku.size, sku.model, sku.color].filter(Boolean).join(" / ") || "ไม่ระบุ Variant";
+  summaryText.append(code, meta);
+  const price = document.createElement("span");
+  price.className = "product-edit-sku-price";
+  price.textContent = formatProductPriceDisplay(sku.salePrice);
+  summary.append(summaryText, price);
+  if (productEditSkuChanged(sku, original)) {
+    const marker = document.createElement("span");
+    marker.className = "product-edit-changed-marker";
+    marker.textContent = "แก้ไขแล้ว";
+    summary.append(marker);
+  }
+  details.append(summary);
+
+  const body = document.createElement("div");
+  body.className = "product-edit-sku-body";
+  body.append(
+    createTextField(`edit_sku_code_${index}`, "SKU", sku.skuCode, true, (value) => {
+      sku.skuCode = value;
+    }),
+    createTextField(`edit_model_${index}`, "รุ่น", sku.model, false, (value) => {
+      sku.model = value;
+    }),
+    createTextField(`edit_color_${index}`, "สี", sku.color, false, (value) => {
+      sku.color = value;
+    }),
+    createTextField(`edit_size_${index}`, "Size", sku.size, false, (value) => {
+      sku.size = value;
+    }),
+    createNumberField(`edit_cost_${index}`, "ต้นทุน", sku.costPrice, true, "0.01", (value) => {
+      sku.costPrice = value;
+    }),
+    createNumberField(`edit_sale_${index}`, "ราคาขาย", sku.salePrice, true, "0.01", (value) => {
+      sku.salePrice = value;
+    }),
+    createIntegerField(`edit_sourceable_${index}`, "เพิ่มได้", sku.sourceableQtyEstimate, false, (value) => {
+      sku.sourceableQtyEstimate = value;
+    }),
+  );
+  const stock = document.createElement("p");
+  stock.className = "placeholder-text";
+  stock.textContent = `Stock ปัจจุบัน: ${formatNumber(sku.onHandQty)} (อ่านอย่างเดียว)`;
+  body.append(stock);
+  details.append(body);
+  return details;
+}
+
+function handleProductEditImageSelection(files) {
+  productEditState.imagePreviewError = "";
+  const file = files && files[0] ? files[0] : null;
+  if (!file) {
+    return;
+  }
+
+  clearProductEditSelectedImage();
+
+  if (!PRODUCT_IMAGE_MIME_TYPES.includes(file.type)) {
+    productEditState.imagePreviewError = "รองรับเฉพาะไฟล์ JPEG หรือ PNG";
+    rerenderProductView();
+    return;
+  }
+
+  if (file.size > PRODUCT_IMAGE_MAX_BYTES) {
+    productEditState.imagePreviewError = "รูปต้องมีขนาดไม่เกิน 2 MB";
+    rerenderProductView();
+    return;
+  }
+
+  productEditState.selectedImageFile = file;
+  productEditState.removeImage = false;
+  try {
+    productEditState.imagePreviewUrl = URL.createObjectURL(file);
+  } catch (error) {
+    productEditState.imagePreviewError = "แสดงตัวอย่างรูปไม่ได้ แต่ยังสามารถลองบันทึกได้";
+  }
+  rerenderProductView();
+}
+
+function clearProductEditSelectedImage() {
+  revokeProductEditImagePreview();
+  productEditState.selectedImageFile = null;
+  productEditState.imagePreviewUrl = "";
+  productEditState.imagePreviewError = "";
+}
+
+function revokeProductEditImagePreview() {
+  if (productEditState.imagePreviewUrl) {
+    URL.revokeObjectURL(productEditState.imagePreviewUrl);
+  }
+}
+
+function openProductEditReview() {
+  productEditState.errors = validateProductEditForm();
+  productEditState.message = "";
+  if (productEditState.errors.length > 0) {
+    rerenderProductView();
+    return;
+  }
+
+  if (!productEditHasAnyChanges()) {
+    productEditState.errors = ["ไม่มีการเปลี่ยนแปลง"];
+    rerenderProductView();
+    return;
+  }
+
+  productEditState.mode = "review";
+  rerenderProductView();
+}
+
+function renderProductEditReview() {
+  const review = document.createElement("section");
+  review.className = "create-review-card product-edit-review";
+
+  const title = document.createElement("h2");
+  title.textContent = "ตรวจสอบการแก้ไข";
+  const note = document.createElement("p");
+  note.className = "placeholder-text";
+  note.textContent = "ระบบจะแก้ข้อมูลสินค้าและ SKU ก่อน จากนั้นจึงจัดการรูปสินค้าแยกต่างหาก";
+  review.append(title, note);
+
+  const changes = productEditChanges();
+  const list = document.createElement("div");
+  list.className = "product-edit-change-list";
+  changes.forEach((change) => {
+    const item = document.createElement("article");
+    item.className = "sku-summary product-edit-change-item";
+    const label = document.createElement("strong");
+    label.textContent = change.label;
+    item.append(label);
+    if (change.before || change.after) {
+      item.append(
+        createReviewLine("เดิม", change.before || "-"),
+        createReviewLine("ใหม่", change.after || "-"),
+      );
+    } else {
+      const action = document.createElement("p");
+      action.className = "placeholder-text";
+      action.textContent = change.action;
+      item.append(action);
+    }
+    list.append(item);
+  });
+  review.append(list);
+
+  const actions = document.createElement("div");
+  actions.className = "create-form-actions";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "secondary-action-button";
+  back.textContent = "กลับไปแก้ไข";
+  back.disabled = productEditState.submitting;
+  back.addEventListener("click", () => {
+    productEditState.mode = "form";
+    productEditState.errors = [];
+    productEditState.message = "";
+    rerenderProductView();
+  });
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "primary-action-button";
+  save.textContent = productEditState.submitting ? "กำลังบันทึก..." : "บันทึกการแก้ไข";
+  save.disabled = productEditState.submitting;
+  save.addEventListener("click", submitProductEdit);
+  actions.append(back, save);
+  review.append(actions);
+  return review;
+}
+
+async function submitProductEdit() {
+  if (productEditState.submitting) {
+    return;
+  }
+
+  productEditState.errors = validateProductEditForm();
+  productEditState.message = "";
+  if (productEditState.errors.length > 0) {
+    productEditState.mode = "form";
+    rerenderProductView();
+    return;
+  }
+
+  productEditState.submitting = true;
+  rerenderProductView();
+
+  const metadataChanged = productEditMetadataChanged();
+  const imageAction = productEditImageAction();
+  let metadataSaved = false;
+
+  try {
+    if (metadataChanged) {
+      const response = await callAuthApi("updateProductMetadata", {
+        sessionToken: requireSessionToken(),
+        ...productEditMetadataPayload(),
+      });
+      requireSuccess(response);
+      metadataSaved = true;
+      markProductEditMetadataCommitted();
+    }
+
+    if (imageAction) {
+      await submitProductEditImageAction(imageAction);
+    }
+
+    const productId = productEditState.form.productId;
+    resetProductEditState();
+    await refreshProductDetail(productId, { showLoading: true });
+  } catch (error) {
+    if (handleProductAuthFailure(error)) {
+      return;
+    }
+
+    productEditState.submitting = false;
+    if (metadataSaved && imageAction) {
+      productEditState.errors = [
+        "บันทึกข้อมูลสินค้าแล้ว แต่บันทึกรูปไม่สำเร็จ กรุณาลองเปลี่ยนรูปอีกครั้ง",
+      ];
+      productEditState.mode = "form";
+      await refreshProductDetail(productEditState.form.productId, { showLoading: false });
+      return;
+    }
+
+    productEditState.errors = [toProductEditErrorMessage(error)];
+    rerenderProductView();
+  }
+}
+
+async function submitProductEditImageAction(action) {
+  if (action === "remove") {
+    const response = await callAuthApi("removeProductImage", {
+      sessionToken: requireSessionToken(),
+      productId: productEditState.form.productId,
+    });
+    requireSuccess(response);
+    return;
+  }
+
+  const file = productEditState.selectedImageFile;
+  const response = await callAuthApi(action, {
+    sessionToken: requireSessionToken(),
+    productId: productEditState.form.productId,
+    fileName: file.name,
+    mimeType: file.type,
+    contentBase64: await fileToBase64(file),
+  });
+  requireSuccess(response);
+}
+
+function cancelProductEditCenter() {
+  if (productEditState.submitting) {
+    return;
+  }
+
+  resetProductEditState();
+  rerenderProductView();
+}
+
+function validateProductEditForm() {
+  const errors = [];
+  const form = productEditState.form;
+  if (!form) {
+    return ["ไม่พบข้อมูลสินค้า"];
+  }
+
+  if (!normalizeProductCodeForUi(form.productCode)) {
+    errors.push("กรุณากรอกรหัสสินค้า");
+  }
+
+  if (!String(form.productName || "").trim()) {
+    errors.push("กรุณากรอกชื่อสินค้า");
+  }
+
+  if (!Array.isArray(form.skus) || form.skus.length !== productEditState.original.skus.length) {
+    errors.push("จำนวน SKU ต้องเท่าเดิม");
+  }
+
+  const seenSkuCodes = {};
+  form.skus.forEach((sku, index) => {
+    const label = sku.skuCode || `SKU #${index + 1}`;
+    const skuCode = normalizeSkuCodeForUi(sku.skuCode);
+    if (!sku.skuId) {
+      errors.push(`${label}: ไม่พบรหัสอ้างอิง SKU`);
+    }
+    if (!skuCode) {
+      errors.push(`${label}: กรุณากรอก SKU`);
+    } else if (seenSkuCodes[skuCode]) {
+      errors.push(`${label}: รหัส SKU ซ้ำในฟอร์ม`);
+    }
+    seenSkuCodes[skuCode] = true;
+
+    if (!isNonNegativeNumberInput(sku.costPrice)) {
+      errors.push(`${label}: ต้นทุนต้องเป็นตัวเลขตั้งแต่ 0 ขึ้นไป`);
+    }
+    if (!isNonNegativeNumberInput(sku.salePrice)) {
+      errors.push(`${label}: ราคาขายต้องเป็นตัวเลขตั้งแต่ 0 ขึ้นไป`);
+    }
+    if (!isNonNegativeIntegerInput(sku.sourceableQtyEstimate || "0")) {
+      errors.push(`${label}: เพิ่มได้ต้องเป็นจำนวนเต็มตั้งแต่ 0 ขึ้นไป`);
+    }
+  });
+
+  if (productEditState.selectedImageFile) {
+    if (!PRODUCT_IMAGE_MIME_TYPES.includes(productEditState.selectedImageFile.type)) {
+      errors.push("รองรับเฉพาะไฟล์ JPEG หรือ PNG");
+    }
+    if (productEditState.selectedImageFile.size > PRODUCT_IMAGE_MAX_BYTES) {
+      errors.push("รูปต้องมีขนาดไม่เกิน 2 MB");
+    }
+  }
+
+  return errors;
+}
+
+function productEditMetadataPayload() {
+  const form = productEditState.form;
+  return {
+    productId: form.productId,
+    product: {
+      productCode: normalizeProductCodeForUi(form.productCode),
+      productName: String(form.productName || "").trim(),
+      category: String(form.category || "").trim(),
+      description: String(form.description || "").trim(),
+    },
+    skus: form.skus.map((sku) => ({
+      skuId: sku.skuId,
+      skuCode: normalizeSkuCodeForUi(sku.skuCode),
+      model: String(sku.model || "").trim(),
+      color: String(sku.color || "").trim(),
+      size: String(sku.size || "").trim(),
+      costPrice: Number(sku.costPrice),
+      salePrice: Number(sku.salePrice),
+      sourceableQtyEstimate: parseSourceableForPayload(sku.sourceableQtyEstimate),
+    })),
+  };
+}
+
+function markProductEditMetadataCommitted() {
+  const payload = productEditMetadataPayload();
+  productEditState.original.productCode = payload.product.productCode;
+  productEditState.original.productName = payload.product.productName;
+  productEditState.original.category = payload.product.category;
+  productEditState.original.description = payload.product.description;
+
+  const originalSkus = productEditById(productEditState.original.skus, "skuId");
+  payload.skus.forEach((sku) => {
+    const original = originalSkus[sku.skuId];
+    if (!original) {
+      return;
+    }
+    original.skuCode = sku.skuCode;
+    original.model = sku.model;
+    original.color = sku.color;
+    original.size = sku.size;
+    original.costPrice = String(sku.costPrice);
+    original.salePrice = String(sku.salePrice);
+    original.sourceableQtyEstimate = String(sku.sourceableQtyEstimate);
+  });
+}
+
+function productEditHasAnyChanges() {
+  return productEditMetadataChanged() || !!productEditImageAction();
+}
+
+function productEditMetadataChanged() {
+  if (!productEditState.form || !productEditState.original) {
+    return false;
+  }
+
+  const payload = productEditMetadataPayload();
+  const originalPayload = productEditOriginalPayload();
+  return JSON.stringify(payload.product) !== JSON.stringify(originalPayload.product) ||
+    JSON.stringify(payload.skus) !== JSON.stringify(originalPayload.skus);
+}
+
+function productEditOriginalPayload() {
+  const original = productEditState.original;
+  return {
+    productId: original.productId,
+    product: {
+      productCode: normalizeProductCodeForUi(original.productCode),
+      productName: String(original.productName || "").trim(),
+      category: String(original.category || "").trim(),
+      description: String(original.description || "").trim(),
+    },
+    skus: original.skus.map((sku) => ({
+      skuId: sku.skuId,
+      skuCode: normalizeSkuCodeForUi(sku.skuCode),
+      model: String(sku.model || "").trim(),
+      color: String(sku.color || "").trim(),
+      size: String(sku.size || "").trim(),
+      costPrice: Number(sku.costPrice),
+      salePrice: Number(sku.salePrice),
+      sourceableQtyEstimate: parseSourceableForPayload(sku.sourceableQtyEstimate),
+    })),
+  };
+}
+
+function productEditImageAction() {
+  if (productEditState.selectedImageFile) {
+    return productEditState.original.hasImage ? "replaceProductImage" : "attachProductImage";
+  }
+  if (productEditState.removeImage && productEditState.original.hasImage) {
+    return "remove";
+  }
+  return "";
+}
+
+function productEditChanges() {
+  const changes = [];
+  const formPayload = productEditMetadataPayload();
+  const originalPayload = productEditOriginalPayload();
+  appendProductEditFieldChange(changes, "รหัสสินค้า", originalPayload.product.productCode, formPayload.product.productCode);
+  appendProductEditFieldChange(changes, "ชื่อสินค้า", originalPayload.product.productName, formPayload.product.productName);
+  appendProductEditFieldChange(changes, "หมวดหมู่", originalPayload.product.category, formPayload.product.category);
+  appendProductEditFieldChange(changes, "รายละเอียด", originalPayload.product.description, formPayload.product.description);
+
+  const originalSkus = productEditById(originalPayload.skus, "skuId");
+  formPayload.skus.forEach((sku) => {
+    const original = originalSkus[sku.skuId] || {};
+    const labelPrefix = `SKU ${original.skuCode || sku.skuCode}`;
+    appendProductEditFieldChange(changes, `${labelPrefix} / SKU`, original.skuCode, sku.skuCode);
+    appendProductEditFieldChange(changes, `${labelPrefix} / รุ่น`, original.model, sku.model);
+    appendProductEditFieldChange(changes, `${labelPrefix} / สี`, original.color, sku.color);
+    appendProductEditFieldChange(changes, `${labelPrefix} / Size`, original.size, sku.size);
+    appendProductEditFieldChange(
+      changes,
+      `${labelPrefix} / ต้นทุน`,
+      formatProductPriceDisplay(original.costPrice),
+      formatProductPriceDisplay(sku.costPrice),
+    );
+    appendProductEditFieldChange(
+      changes,
+      `${labelPrefix} / ราคาขาย`,
+      formatProductPriceDisplay(original.salePrice),
+      formatProductPriceDisplay(sku.salePrice),
+    );
+    appendProductEditFieldChange(
+      changes,
+      `${labelPrefix} / เพิ่มได้`,
+      formatNumber(original.sourceableQtyEstimate),
+      formatNumber(sku.sourceableQtyEstimate),
+    );
+  });
+
+  const imageAction = productEditImageAction();
+  if (imageAction === "attachProductImage") {
+    changes.push({ label: "รูปสินค้า", action: "เพิ่มรูป" });
+  } else if (imageAction === "replaceProductImage") {
+    changes.push({ label: "รูปสินค้า", action: "เปลี่ยนรูป" });
+  } else if (imageAction === "remove") {
+    changes.push({ label: "รูปสินค้า", action: "ลบรูป" });
+  }
+  return changes;
+}
+
+function appendProductEditFieldChange(changes, label, before, after) {
+  const beforeText = String(before || "").trim();
+  const afterText = String(after || "").trim();
+  if (beforeText !== afterText) {
+    changes.push({
+      label,
+      before: beforeText || "-",
+      after: afterText || "-",
+    });
+  }
+}
+
+function productEditSkuChanged(sku, original) {
+  if (!original) {
+    return false;
+  }
+
+  return normalizeSkuCodeForUi(sku.skuCode) !== normalizeSkuCodeForUi(original.skuCode) ||
+    String(sku.model || "").trim() !== String(original.model || "").trim() ||
+    String(sku.color || "").trim() !== String(original.color || "").trim() ||
+    String(sku.size || "").trim() !== String(original.size || "").trim() ||
+    Number(sku.costPrice) !== Number(original.costPrice) ||
+    Number(sku.salePrice) !== Number(original.salePrice) ||
+    parseSourceableForPayload(sku.sourceableQtyEstimate) !== parseSourceableForPayload(original.sourceableQtyEstimate);
+}
+
+function productEditById(records, idField) {
+  const byId = {};
+  records.forEach((record) => {
+    byId[record[idField]] = record;
+  });
+  return byId;
+}
+
+function productEditNumberInputValue(value) {
+  if (value === null || typeof value === "undefined") {
+    return "";
+  }
+  return String(value);
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const result = String(reader.result || "");
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex === -1 ? result : result.slice(commaIndex + 1));
+    });
+    reader.addEventListener("error", () => reject(new Error("IMAGE_READ_FAILED")));
+    reader.readAsDataURL(file);
+  });
+}
+
+function toProductEditErrorMessage(error) {
+  const code = error && (error.code || error.message);
+  if (code === "PERMISSION_DENIED") {
+    return "บัญชีนี้ไม่มีสิทธิ์แก้ไขสินค้า";
+  }
+  if (code === "VALIDATION_ERROR") {
+    return "ข้อมูลสินค้าไม่ถูกต้อง กรุณาตรวจสอบรหัสสินค้า SKU ราคา และข้อมูลที่จำเป็น";
+  }
+  if (code === "NOT_FOUND") {
+    return "ไม่พบสินค้านี้";
+  }
+  if (code === "IMAGE_READ_FAILED") {
+    return "อ่านไฟล์รูปไม่สำเร็จ กรุณาเลือกรูปใหม่";
+  }
+  return toThaiErrorMessage(error);
+}
+
 function rerenderProductView() {
   if (activeViewName === "products" && currentUser) {
     setView("products");
@@ -1132,6 +2049,22 @@ function rerenderProductView() {
 
 function canUseCreateProductUi() {
   return !!currentUser && currentUser.role === OWNER_ROLE;
+}
+
+function canUseProductEditUi() {
+  if (!currentUser) {
+    return false;
+  }
+
+  if (currentUser.role === OWNER_ROLE) {
+    return true;
+  }
+
+  if (currentUser.role !== ADMIN_ROLE || !Array.isArray(currentUser.permissions)) {
+    return false;
+  }
+
+  return currentUser.permissions.includes(MANAGE_PRODUCTS_PERMISSION);
 }
 
 function canUseStockMutationUi() {
@@ -1151,6 +2084,10 @@ function canUseStockMutationUi() {
 }
 
 function normalizeSkuCodeForUi(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function normalizeProductCodeForUi(value) {
   return String(value || "").trim().toUpperCase();
 }
 
@@ -1245,47 +2182,208 @@ function updateProductDom() {
 }
 
 function createProductCard(product) {
+  return createSharedProductCard(product, {
+    mode: "product",
+    onProductClick: () => openProductDetail(product),
+  });
+}
+
+function createSharedProductCard(product, options) {
+  const settings = options || {};
   const article = document.createElement("article");
-  article.className = "card product-card";
+  article.className = `card product-card shared-product-card ${settings.mode === "stock" ? "stock-card" : ""}`.trim();
 
-  const button = document.createElement("button");
-  button.className = "product-card-button";
-  button.type = "button";
-  button.addEventListener("click", () => openProductDetail(product));
+  const body = document.createElement(settings.onProductClick ? "button" : "div");
+  body.className = "product-card-button shared-product-body";
+  if (settings.onProductClick) {
+    body.type = "button";
+    body.addEventListener("click", settings.onProductClick);
+  }
 
+  const skus = Array.isArray(product && product.skus) ? product.skus : [];
   const header = document.createElement("div");
-  header.className = "product-card-header";
-
-  const titleWrap = document.createElement("div");
-  const title = document.createElement("h2");
-  title.textContent = product.productName || "ไม่ระบุชื่อสินค้า";
-  const category = document.createElement("p");
-  category.className = "placeholder-text";
-  category.textContent = product.category || "ไม่ระบุหมวดหมู่";
-  titleWrap.append(title, category);
-
-  const status = document.createElement("span");
-  status.className = "status-pill";
-  status.textContent = product.status || "-";
-  header.append(titleWrap, status);
-
-  const summary = document.createElement("div");
-  summary.className = "product-meta-grid";
-  summary.append(
-    createMetric("SKU", product.skuCount || 0),
-    createMetric("สถานะ", product.status || "-"),
+  header.className = "shared-product-header";
+  header.append(
+    createSharedProductImage(product),
+    createSharedProductTitle(product, skus.length > 1 ? formatSkuPriceRange(skus) : ""),
   );
 
-  const skuList = document.createElement("div");
-  skuList.className = "sku-list";
-  const skus = Array.isArray(product.skus) ? product.skus : [];
-  skus.forEach((sku) => {
-    skuList.append(createSkuSummary(sku));
-  });
+  const content = skus.length <= 1
+    ? createSharedSingleSkuContent(product, skus[0] || null, settings)
+    : createSharedMultiSkuContent(product, skus, settings);
 
-  button.append(header, summary, skuList);
-  article.append(button);
+  body.append(header, content);
+  article.append(body);
   return article;
+}
+
+function createSharedProductImage(product) {
+  const slot = document.createElement("div");
+  slot.className = "shared-product-image-slot";
+
+  if (product && product.hasImage && product.imageUrl) {
+    const image = document.createElement("img");
+    image.className = "shared-product-image";
+    image.src = product.imageUrl;
+    image.alt = product.productName || "รูปสินค้า";
+    image.loading = "lazy";
+    slot.append(image);
+    return slot;
+  }
+
+  const placeholder = document.createElement("span");
+  placeholder.textContent = "ไม่มีรูป";
+  slot.append(placeholder);
+  return slot;
+}
+
+function createSharedProductTitle(product, priceText) {
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "shared-product-title";
+
+  if ((product && product.productCode) || priceText) {
+    const top = document.createElement("div");
+    top.className = "shared-product-title-top";
+
+    const code = document.createElement("p");
+    code.className = "shared-product-code";
+    code.textContent = product && product.productCode ? product.productCode : "";
+    top.append(code);
+
+    if (priceText) {
+      const price = document.createElement("p");
+      price.className = "shared-product-header-price";
+      price.textContent = priceText;
+      top.append(price);
+    }
+
+    titleWrap.append(top);
+  }
+
+  const title = document.createElement("h2");
+  title.className = "shared-product-name";
+  title.textContent = product && product.productName ? product.productName : "ไม่ระบุชื่อสินค้า";
+  titleWrap.append(title);
+  return titleWrap;
+}
+
+function createSharedSingleSkuContent(product, sku, settings) {
+  const content = document.createElement("div");
+  content.className = "shared-product-content";
+
+  if (sku) {
+    const variant = document.createElement("p");
+    variant.className = "placeholder-text shared-product-variant";
+    variant.textContent = formatVariantText(sku) || sku.skuCode || "ไม่ระบุรายละเอียด SKU";
+    content.append(variant);
+  }
+
+  const metrics = document.createElement("div");
+  metrics.className = "shared-product-metrics";
+  metrics.append(
+    createSharedMetric("ราคาขาย", sku ? formatProductPriceDisplay(sku.salePrice) : "-"),
+    createSharedMetric("จำนวน", sku ? formatNumber(sku.onHandQty) : "0"),
+    createSharedMetric("เพิ่มได้", sku ? formatNumber(sku.sourceableQtyEstimate) : "0"),
+  );
+  content.append(metrics);
+
+  return content;
+}
+
+function createSharedMultiSkuContent(product, skus, settings) {
+  const content = document.createElement("div");
+  content.className = "shared-product-content";
+
+  const table = document.createElement("div");
+  table.className = "shared-product-size-table";
+  table.append(createSharedSkuHeader());
+  skus.forEach((sku) => {
+    table.append(createSharedSkuRow(product, sku, settings));
+  });
+  content.append(table);
+  return content;
+}
+
+function createSharedMetric(label, value) {
+  const item = document.createElement("div");
+  item.className = "shared-product-metric";
+  const strong = document.createElement("strong");
+  strong.textContent = value;
+  const span = document.createElement("span");
+  span.textContent = label;
+  item.append(strong, span);
+  return item;
+}
+
+function createSharedSkuHeader() {
+  const row = document.createElement("div");
+  row.className = "shared-product-size-row shared-product-size-head";
+  ["ไซซ์", "จำนวน", "เพิ่มได้"].forEach((label) => {
+    const cell = document.createElement("span");
+    cell.textContent = label;
+    row.append(cell);
+  });
+  return row;
+}
+
+function createSharedSkuRow(product, sku, settings) {
+  const isStock = settings.mode === "stock" && typeof settings.onSkuClick === "function";
+  const row = document.createElement(isStock ? "button" : "div");
+  row.className = `shared-product-size-row ${isStock ? "is-clickable" : ""}`.trim();
+  if (isStock) {
+    row.type = "button";
+    row.addEventListener("click", () => settings.onSkuClick(product, sku));
+  }
+
+  const size = document.createElement("strong");
+  size.textContent = sharedSkuDisplayName(sku);
+  const onHand = document.createElement("span");
+  onHand.textContent = formatNumber(sku.onHandQty);
+  const sourceable = document.createElement("span");
+  sourceable.textContent = formatNumber(sku.sourceableQtyEstimate);
+  row.append(size, onHand, sourceable);
+
+  return row;
+}
+
+function sharedSkuDisplayName(sku) {
+  return (sku && sku.size) ||
+    [sku && sku.model, sku && sku.color].filter(Boolean).join(" / ") ||
+    (sku && sku.skuCode) ||
+    "SKU";
+}
+
+function formatSkuPriceRange(skus) {
+  const prices = (Array.isArray(skus) ? skus : [])
+    .map((sku) => Number(sku.salePrice))
+    .filter((value) => Number.isFinite(value));
+  if (prices.length === 0) {
+    return "-";
+  }
+
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  return min === max
+    ? formatProductPriceDisplay(min)
+    : `${formatProductPriceDisplay(min)} – ${formatProductPriceDisplay(max)}`;
+}
+
+function formatProductPriceDisplay(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "-";
+  }
+
+  if (!Number.isInteger(number)) {
+    return new Intl.NumberFormat("th-TH", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(number);
+  }
+
+  return `${new Intl.NumberFormat("th-TH", {
+    maximumFractionDigits: 0,
+  }).format(number)}.-`;
 }
 
 function createMetric(label, value) {
@@ -1309,7 +2407,7 @@ function createSkuSummary(sku) {
   code.className = "sku-code";
   code.textContent = sku.skuCode || "-";
   const price = document.createElement("span");
-  price.textContent = formatBaht(sku.salePrice);
+  price.textContent = formatProductPriceDisplay(sku.salePrice);
   top.append(code, price);
 
   const variant = document.createElement("p");
@@ -1365,6 +2463,11 @@ function renderProductDetailView() {
     return view;
   }
 
+  if (productEditState.mode !== "view") {
+    view.append(renderProductEditCenter());
+    return view;
+  }
+
   const product = productState.detail;
   const card = document.createElement("section");
   card.className = "card product-detail-card";
@@ -1372,12 +2475,30 @@ function renderProductDetailView() {
   const header = document.createElement("div");
   header.className = "product-detail-header";
   const titleWrap = document.createElement("div");
+  const code = document.createElement("p");
+  code.className = "placeholder-text";
+  code.textContent = product.productCode || "";
   const title = document.createElement("h2");
   title.textContent = product.productName || "รายละเอียดสินค้า";
   const meta = document.createElement("p");
   meta.className = "placeholder-text";
   meta.textContent = `${product.category || "ไม่ระบุหมวดหมู่"} · ${product.status || "-"}`;
+  if (product.productCode) {
+    titleWrap.append(code);
+  }
   titleWrap.append(title, meta);
+
+  const headerActions = document.createElement("div");
+  headerActions.className = "product-detail-actions";
+
+  if (canUseProductEditUi()) {
+    const edit = document.createElement("button");
+    edit.className = "secondary-action-button";
+    edit.type = "button";
+    edit.textContent = "แก้ไขสินค้า";
+    edit.addEventListener("click", () => openProductEditCenter(product));
+    headerActions.append(edit);
+  }
 
   const close = document.createElement("button");
   close.className = "detail-close-button";
@@ -1385,7 +2506,17 @@ function renderProductDetailView() {
   close.disabled = productState.detailTransition === "exit";
   close.textContent = "กลับ";
   close.addEventListener("click", closeProductDetail);
-  header.append(titleWrap, close);
+  headerActions.append(close);
+  header.append(titleWrap, headerActions);
+
+  if (product.hasImage && product.imageUrl) {
+    const image = document.createElement("img");
+    image.className = "product-detail-image";
+    image.src = product.imageUrl;
+    image.alt = product.productName || "รูปสินค้า";
+    image.loading = "lazy";
+    card.append(image);
+  }
 
   const skuList = document.createElement("div");
   skuList.className = "sku-list detail-sku-list";
@@ -1399,7 +2530,7 @@ function renderProductDetailView() {
 }
 
 function closeProductDetail() {
-  if (productState.detailTransition === "exit") {
+  if (productState.detailTransition === "exit" || productEditState.submitting) {
     return;
   }
 
@@ -1409,6 +2540,7 @@ function closeProductDetail() {
     productState.detailError = "";
     productState.detailLoading = false;
     productState.detailTransition = "";
+    resetProductEditState();
     rerenderProductView();
     scheduleProductListScrollRestore();
   };
@@ -2746,45 +3878,107 @@ function renderShipmentSkuPicker() {
   return card;
 }
 
-function renderShipmentSkuPickerItem(item, existingSkuCodes) {
-  const normalizedSkuCode = normalizeSkuCodeForUi(item.skuCode);
+function renderShipmentSkuPickerItem(product, existingSkuCodes) {
+  const card = document.createElement("article");
+  card.className = "shipment-picker-product-card";
+
+  const header = document.createElement("div");
+  header.className = "shipment-picker-product-header";
+  header.append(createShipmentPickerProductImage(product), createShipmentPickerProductTitle(product));
+  card.append(header);
+
+  const skuList = document.createElement("div");
+  skuList.className = "shipment-picker-sku-list";
+  const skus = Array.isArray(product && product.skus) ? product.skus : [];
+  skus.forEach((sku) => {
+    skuList.append(renderShipmentSkuPickerSkuRow(product, sku, existingSkuCodes));
+  });
+  card.append(skuList);
+  return card;
+}
+
+function createShipmentPickerProductImage(product) {
+  const slot = document.createElement("div");
+  slot.className = "shipment-picker-image-slot";
+
+  if (product && product.hasImage && product.imageUrl) {
+    const image = document.createElement("img");
+    image.src = product.imageUrl;
+    image.alt = product.productName || "รูปสินค้า";
+    image.loading = "lazy";
+    slot.append(image);
+    return slot;
+  }
+
+  const placeholder = document.createElement("span");
+  placeholder.textContent = "ไม่มีรูป";
+  slot.append(placeholder);
+  return slot;
+}
+
+function createShipmentPickerProductTitle(product) {
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "shipment-picker-product-title";
+
+  if (product && product.productCode) {
+    const code = document.createElement("p");
+    code.className = "shipment-picker-product-code";
+    code.textContent = product.productCode;
+    titleWrap.append(code);
+  }
+
+  const name = document.createElement("h4");
+  name.textContent = product && product.productName ? product.productName : "ไม่ระบุชื่อสินค้า";
+  titleWrap.append(name);
+  return titleWrap;
+}
+
+function renderShipmentSkuPickerSkuRow(product, sku, existingSkuCodes) {
+  const normalizedSkuCode = normalizeSkuCodeForUi(sku.skuCode);
   const alreadyAdded = existingSkuCodes.has(normalizedSkuCode);
   const selected = !!shipmentCreateState.picker.selectedItems[normalizedSkuCode];
   const row = document.createElement("label");
-  row.className = alreadyAdded ? "shipment-picker-row is-disabled" : "shipment-picker-row";
+  row.className = `shipment-picker-sku-row ${alreadyAdded ? "is-disabled" : ""} ${selected ? "is-selected" : ""}`.trim();
 
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   checkbox.checked = selected || alreadyAdded;
   checkbox.disabled = alreadyAdded;
   checkbox.addEventListener("change", (event) => {
-    toggleShipmentSkuPickerSelection(item, event.target.checked);
+    toggleShipmentSkuPickerSelection(product, sku, event.target.checked);
   });
 
   const body = document.createElement("div");
-  body.className = "shipment-picker-row-body";
-  const codeLine = document.createElement("div");
-  codeLine.className = "shipment-picker-code-line";
-  const code = document.createElement("strong");
-  code.textContent = normalizedSkuCode || "-";
-  const flag = document.createElement("span");
-  flag.className = "status-pill";
-  flag.textContent = alreadyAdded ? "เพิ่มแล้ว" : item.status || "เลือกได้";
-  codeLine.append(code, flag);
+  body.className = "shipment-picker-sku-body";
+  const top = document.createElement("div");
+  top.className = "shipment-picker-sku-top";
+  const variant = document.createElement("strong");
+  variant.textContent = shipmentPickerSkuVariantLabel(sku);
+  top.append(variant);
 
-  const name = document.createElement("p");
-  name.className = "shipment-picker-name";
-  name.textContent = item.productName || "ไม่ระบุชื่อสินค้า";
-  const meta = document.createElement("p");
-  meta.className = "placeholder-text shipment-picker-meta";
-  meta.textContent = formatVariantText(item) || "ไม่ระบุรายละเอียด SKU";
+  if (alreadyAdded) {
+    const flag = document.createElement("span");
+    flag.textContent = "เพิ่มแล้ว";
+    top.append(flag);
+  }
+
+  const code = document.createElement("p");
+  code.className = "placeholder-text shipment-picker-sku-code";
+  code.textContent = normalizedSkuCode || "-";
   const stock = document.createElement("p");
   stock.className = "placeholder-text shipment-picker-stock";
-  stock.textContent = `Stock ปัจจุบัน: ${formatOptionalNumber(item.onHandQty)}`;
-  body.append(codeLine, name, meta, stock);
+  stock.textContent = `Stock ${formatOptionalNumber(sku.onHandQty)}`;
+  body.append(top, code, stock);
 
   row.append(checkbox, body);
   return row;
+}
+
+function shipmentPickerSkuVariantLabel(sku) {
+  return (sku && sku.size) ||
+    [sku && sku.model, sku && sku.color].filter(Boolean).join(" / ") ||
+    (sku && sku.skuCode) ||
+    "SKU";
 }
 
 function updateShipmentSkuPickerDom() {
@@ -2864,14 +4058,14 @@ async function loadShipmentSkuPickerItems({ reset }) {
   updateShipmentSkuPickerDom();
 
   try {
-    const action = picker.query.trim() ? "searchStock" : "listStock";
+    const action = picker.query.trim() ? "searchProducts" : "listProducts";
     const payload = {
       sessionToken: requireSessionToken(),
       page: picker.page,
       pageSize: picker.pageSize,
     };
 
-    if (action === "searchStock") {
+    if (action === "searchProducts") {
       payload.query = picker.query.trim();
     }
 
@@ -2885,7 +4079,7 @@ async function loadShipmentSkuPickerItems({ reset }) {
     const nextItems = Array.isArray(data.items) ? data.items : [];
     shipmentCreateState.picker.items = reset
       ? nextItems
-      : appendUniqueStockItems(shipmentCreateState.picker.items, nextItems);
+      : appendUniqueProducts(shipmentCreateState.picker.items, nextItems);
     shipmentCreateState.picker.hasMore = !!data.hasMore;
   } catch (error) {
     if (handleProductAuthFailure(error)) {
@@ -2913,14 +4107,14 @@ function loadMoreShipmentSkuPickerItems() {
   loadShipmentSkuPickerItems({ reset: false });
 }
 
-function toggleShipmentSkuPickerSelection(item, shouldSelect) {
-  const normalizedSkuCode = normalizeSkuCodeForUi(item.skuCode);
+function toggleShipmentSkuPickerSelection(product, sku, shouldSelect) {
+  const normalizedSkuCode = normalizeSkuCodeForUi(sku.skuCode);
   if (!normalizedSkuCode || getShipmentCreateSkuCodeSet().has(normalizedSkuCode)) {
     return;
   }
 
   if (shouldSelect) {
-    shipmentCreateState.picker.selectedItems[normalizedSkuCode] = createShipmentItemFormFromStockItem(item);
+    shipmentCreateState.picker.selectedItems[normalizedSkuCode] = createShipmentItemFormFromProductSku(product, sku);
   } else {
     delete shipmentCreateState.picker.selectedItems[normalizedSkuCode];
   }
@@ -3264,6 +4458,18 @@ function createShipmentItemFormFromStockItem(item) {
   };
 }
 
+function createShipmentItemFormFromProductSku(product, sku) {
+  return {
+    skuCode: normalizeSkuCodeForUi(sku.skuCode),
+    quantity: "",
+    productName: product && product.productName ? product.productName : "",
+    model: sku.model || "",
+    color: sku.color || "",
+    size: sku.size || "",
+    onHandQty: sku.onHandQty,
+  };
+}
+
 function getShipmentCreateSkuCodeSet() {
   return new Set(shipmentCreateState.form.items
     .map((item) => normalizeSkuCodeForUi(item.skuCode))
@@ -3570,14 +4776,14 @@ async function loadStock(options) {
 
   try {
     const token = requireSessionToken();
-    const action = stockState.query.trim() ? "searchStock" : "listStock";
+    const action = stockState.query.trim() ? "searchProducts" : "listProducts";
     const payload = {
       sessionToken: token,
       page: stockState.page,
       pageSize: stockState.pageSize,
     };
 
-    if (action === "searchStock") {
+    if (action === "searchProducts") {
       payload.query = stockState.query.trim();
     }
 
@@ -3589,7 +4795,7 @@ async function loadStock(options) {
     }
 
     const nextItems = Array.isArray(data.items) ? data.items : [];
-    stockState.items = reset ? nextItems : appendUniqueStockItems(stockState.items, nextItems);
+    stockState.items = reset ? nextItems : appendUniqueProducts(stockState.items, nextItems);
     stockState.hasMore = !!data.hasMore;
   } catch (error) {
     if (handleProductAuthFailure(error)) {
@@ -3617,8 +4823,8 @@ function updateStockDom() {
   stockDom.status.dataset.type = "info";
 
   clearElement(stockDom.list);
-  stockState.items.forEach((item) => {
-    stockDom.list.append(createStockCard(item));
+  stockState.items.forEach((product) => {
+    stockDom.list.append(createStockCard(product));
   });
 
   if (stockState.loading && stockState.items.length === 0) {
@@ -3644,45 +4850,28 @@ function updateStockDom() {
   stockDom.loadMoreButton.disabled = stockState.loading;
 }
 
-function createStockCard(item) {
-  const article = document.createElement("article");
-  article.className = "card product-card stock-card";
+function createStockCard(product) {
+  const skus = Array.isArray(product && product.skus) ? product.skus : [];
+  return createSharedProductCard(product, {
+    mode: "stock",
+    onSkuClick: (selectedProduct, sku) => openStockDetail(stockDetailItemFromProductSku(selectedProduct, sku)),
+    onProductClick: skus.length === 1
+      ? () => openStockDetail(stockDetailItemFromProductSku(product, skus[0]))
+      : null,
+  });
+}
 
-  const button = document.createElement("button");
-  button.className = "product-card-button stock-card-button";
-  button.type = "button";
-  button.addEventListener("click", () => openStockDetail(item));
-
-  const header = document.createElement("div");
-  header.className = "product-card-header";
-
-  const titleWrap = document.createElement("div");
-  const title = document.createElement("h2");
-  title.textContent = item.skuCode || "-";
-  const productName = document.createElement("p");
-  productName.className = "placeholder-text";
-  productName.textContent = item.productName || "ไม่ระบุชื่อสินค้า";
-  titleWrap.append(title, productName);
-
-  const status = document.createElement("span");
-  status.className = "status-pill";
-  status.textContent = item.status || "-";
-  header.append(titleWrap, status);
-
-  const variant = document.createElement("p");
-  variant.className = "placeholder-text";
-  variant.textContent = formatVariantText(item) || "ไม่ระบุรายละเอียด SKU";
-
-  const quantities = document.createElement("div");
-  quantities.className = "quantity-row";
-  quantities.append(
-    createQuantityChip("Stock", item.onHandQty),
-    createQuantityChip("หาเพิ่มได้", item.sourceableQtyEstimate),
-  );
-
-  button.append(header, variant, quantities);
-  article.append(button);
-  return article;
+function stockDetailItemFromProductSku(product, sku) {
+  return {
+    skuCode: sku && sku.skuCode ? sku.skuCode : "",
+    productName: product && product.productName ? product.productName : "",
+    model: sku && sku.model ? sku.model : "",
+    color: sku && sku.color ? sku.color : "",
+    size: sku && sku.size ? sku.size : "",
+    status: product && product.status ? product.status : "",
+    onHandQty: sku ? sku.onHandQty : 0,
+    sourceableQtyEstimate: sku ? sku.sourceableQtyEstimate : 0,
+  };
 }
 
 function openStockDetail(item) {
@@ -4095,7 +5284,7 @@ async function refreshStockAfterMutation(skuCode) {
 }
 
 async function fetchStockRefreshSnapshot(token, query, pageSize) {
-  const action = query ? "searchStock" : "listStock";
+  const action = query ? "searchProducts" : "listProducts";
   const payload = {
     sessionToken: token,
     page: 1,
@@ -4116,7 +5305,17 @@ async function fetchStockRefreshSnapshot(token, query, pageSize) {
 
 function findStockItemBySkuCode(items, skuCode) {
   const normalizedSkuCode = normalizeSkuCodeForUi(skuCode);
-  return (Array.isArray(items) ? items : []).find((item) => normalizeSkuCodeForUi(item.skuCode) === normalizedSkuCode) || null;
+  const products = Array.isArray(items) ? items : [];
+
+  for (const product of products) {
+    const skus = Array.isArray(product && product.skus) ? product.skus : [];
+    const sku = skus.find((candidate) => normalizeSkuCodeForUi(candidate.skuCode) === normalizedSkuCode);
+    if (sku) {
+      return stockDetailItemFromProductSku(product, sku);
+    }
+  }
+
+  return null;
 }
 
 function validateStockMutationForm() {
