@@ -54,6 +54,9 @@ const productState = {
   loading: false,
   error: "",
   items: [],
+  listItems: [],
+  listHasMore: false,
+  knownItems: [],
   detail: null,
   detailLoading: false,
   detailError: "",
@@ -71,6 +74,9 @@ const stockState = {
   loading: false,
   error: "",
   items: [],
+  listItems: [],
+  listHasMore: false,
+  knownItems: [],
   detail: null,
   history: [],
   historyLoading: false,
@@ -89,6 +95,8 @@ const shipmentState = {
   loading: false,
   error: "",
   items: [],
+  listItems: [],
+  listHasMore: false,
   detail: null,
   detailLoading: false,
   detailError: "",
@@ -546,6 +554,7 @@ function renderProductView() {
   searchInput.value = productState.query;
   searchInput.addEventListener("input", (event) => {
     productState.query = event.target.value;
+    applyProductLocalSearchPreview();
     clearTimeout(productSearchTimer);
     productSearchTimer = setTimeout(() => {
       loadProducts({ reset: true });
@@ -613,11 +622,11 @@ async function loadProducts(options) {
   const reset = !!(options && options.reset);
   const requestId = productState.requestId + 1;
   productState.requestId = requestId;
+  const query = productState.query.trim();
 
   if (reset) {
     productState.page = 1;
-    productState.items = [];
-    productState.hasMore = false;
+    applyProductLocalSearchPreview();
     productState.detail = null;
     productState.detailError = "";
   }
@@ -629,7 +638,7 @@ async function loadProducts(options) {
 
   try {
     const token = requireSessionToken();
-    const action = productState.query.trim() ? "searchProducts" : "listProducts";
+    const action = query ? "searchProducts" : "listProducts";
     const payload = {
       sessionToken: token,
       page: productState.page,
@@ -637,17 +646,22 @@ async function loadProducts(options) {
     };
 
     if (action === "searchProducts") {
-      payload.query = productState.query.trim();
+      payload.query = query;
     }
 
     const response = await callAuthApi(action, payload);
     const data = requireSuccess(response);
 
-    if (requestId !== productState.requestId) {
+    if (requestId !== productState.requestId || query !== productState.query.trim()) {
       return;
     }
 
     const nextItems = Array.isArray(data.items) ? data.items : [];
+    productState.knownItems = mergeProductSnapshots(productState.knownItems, nextItems);
+    if (action === "listProducts") {
+      productState.listItems = reset ? nextItems : appendUniqueProducts(productState.listItems, nextItems);
+      productState.listHasMore = !!data.hasMore;
+    }
     productState.items = reset ? nextItems : appendUniqueProducts(productState.items, nextItems);
     productState.hasMore = !!data.hasMore;
   } catch (error) {
@@ -675,7 +689,7 @@ function openProductDetail(product) {
   productState.detailTransition = "enter";
   resetProductEditState();
   rerenderProductView();
-  refreshProductDetail(product.productId, { showLoading: true });
+  refreshProductDetail(product.productId, { showLoading: false });
 }
 
 async function refreshProductDetail(productId, options) {
@@ -699,7 +713,7 @@ async function refreshProductDetail(productId, options) {
       productId: normalizedProductId,
     });
     const detail = requireSuccess(response);
-    if (requestId !== productState.detailRequestId) {
+    if (!isActiveProductDetailRequest(normalizedProductId, requestId)) {
       return;
     }
 
@@ -710,15 +724,22 @@ async function refreshProductDetail(productId, options) {
     if (handleProductAuthFailure(error)) {
       return;
     }
-    if (requestId === productState.detailRequestId) {
+    if (isActiveProductDetailRequest(normalizedProductId, requestId)) {
       productState.detailError = toThaiErrorMessage(error);
     }
   } finally {
-    if (requestId === productState.detailRequestId) {
+    if (isActiveProductDetailRequest(normalizedProductId, requestId)) {
       productState.detailLoading = false;
       rerenderProductView();
     }
   }
+}
+
+function isActiveProductDetailRequest(productId, requestId) {
+  return requestId === productState.detailRequestId &&
+    productState.detail &&
+    productState.detailTransition !== "exit" &&
+    String(productState.detail.productId || "").trim() === String(productId || "").trim();
 }
 
 function updateProductListItem(product) {
@@ -726,10 +747,9 @@ function updateProductListItem(product) {
     return;
   }
 
-  const index = productState.items.findIndex((item) => item.productId === product.productId);
-  if (index !== -1) {
-    productState.items[index] = product;
-  }
+  productState.items = replaceProductInList(productState.items, product, false);
+  productState.listItems = replaceProductInList(productState.listItems, product, false);
+  productState.knownItems = replaceProductInList(productState.knownItems, product, true);
 }
 
 function renderCreateProductFlow() {
@@ -2316,7 +2336,9 @@ function updateProductDom() {
       ? "ไม่พบสินค้าที่ตรงกับคำค้นหา"
       : "ยังไม่มีข้อมูลสินค้า";
   } else if (productState.loading) {
-    productDom.status.textContent = "กำลังโหลดเพิ่มเติม...";
+    productDom.status.textContent = productState.query.trim()
+      ? "แสดงผลจากข้อมูลในเครื่อง กำลังค้นหาจาก Backend..."
+      : "กำลังอัปเดตรายการล่าสุด...";
   } else {
     productDom.status.textContent = productState.query.trim()
       ? "ผลการค้นหาแบบอ่านอย่างเดียว"
@@ -2590,7 +2612,7 @@ function renderProductDetailView() {
     view.classList.add("is-exiting");
   }
 
-  if (productState.detailLoading) {
+  if (productState.detailLoading && !productState.detail) {
     const loading = document.createElement("section");
     loading.className = "card product-detail-card";
     loading.textContent = "กำลังโหลดรายละเอียดสินค้า...";
@@ -2665,6 +2687,18 @@ function renderProductDetailView() {
     card.append(image);
   }
 
+  if (productState.detailLoading) {
+    const loading = document.createElement("p");
+    loading.className = "product-status";
+    loading.textContent = "กำลังอัปเดตรายละเอียดล่าสุด...";
+    card.append(loading);
+  } else if (productState.detailError) {
+    const warning = document.createElement("p");
+    warning.className = "product-status product-error";
+    warning.textContent = `แสดงข้อมูลล่าสุดในเครื่อง: ${productState.detailError}`;
+    card.append(warning);
+  }
+
   const skuList = document.createElement("div");
   skuList.className = "sku-list detail-sku-list";
   (Array.isArray(product.skus) ? product.skus : []).forEach((sku) => {
@@ -2681,6 +2715,7 @@ function closeProductDetail() {
     return;
   }
 
+  productState.detailRequestId += 1;
   const detailView = document.querySelector(".product-detail-view");
   const finish = () => {
     productState.detail = null;
@@ -2760,6 +2795,103 @@ function appendUniqueProducts(existingItems, nextItems) {
     }
   });
   return merged;
+}
+
+function mergeProductSnapshots(existingItems, nextItems) {
+  const merged = Array.isArray(existingItems) ? [...existingItems] : [];
+  (Array.isArray(nextItems) ? nextItems : []).forEach((item) => {
+    if (!item || !item.productId) {
+      return;
+    }
+    const index = merged.findIndex((candidate) => candidate.productId === item.productId);
+    if (index === -1) {
+      merged.push(item);
+    } else {
+      merged[index] = item;
+    }
+  });
+  return merged;
+}
+
+function replaceProductInList(items, product, appendIfMissing) {
+  let replaced = false;
+  const nextItems = (Array.isArray(items) ? items : []).map((item) => {
+    if (item.productId === product.productId) {
+      replaced = true;
+      return product;
+    }
+    return item;
+  });
+  return replaced || !appendIfMissing ? nextItems : nextItems.concat(product);
+}
+
+function applyProductLocalSearchPreview() {
+  const query = productState.query.trim();
+  if (query) {
+    productState.items = filterProductItemsByQuery(productState.knownItems, query);
+    productState.hasMore = false;
+    productState.error = "";
+    updateProductDom();
+    return;
+  }
+
+  if (productState.listItems.length > 0) {
+    productState.items = productState.listItems;
+    productState.hasMore = productState.listHasMore;
+    productState.error = "";
+    updateProductDom();
+  }
+}
+
+function applyStockLocalSearchPreview() {
+  const query = stockState.query.trim();
+  const knownItems = stockState.knownItems.length > 0 ? stockState.knownItems : productState.knownItems;
+  if (query) {
+    stockState.items = filterProductItemsByQuery(knownItems, query);
+    stockState.hasMore = false;
+    stockState.error = "";
+    updateStockDom();
+    return;
+  }
+
+  if (stockState.listItems.length > 0) {
+    stockState.items = stockState.listItems;
+    stockState.hasMore = stockState.listHasMore;
+    stockState.error = "";
+    updateStockDom();
+  } else if (productState.listItems.length > 0) {
+    stockState.items = productState.listItems;
+    stockState.hasMore = productState.listHasMore;
+    stockState.error = "";
+    updateStockDom();
+  }
+}
+
+function filterProductItemsByQuery(items, query) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  if (!normalizedQuery) {
+    return Array.isArray(items) ? items : [];
+  }
+
+  return (Array.isArray(items) ? items : []).filter((product) => productMatchesQuery(product, normalizedQuery));
+}
+
+function productMatchesQuery(product, query) {
+  if (productTextContains(product.productCode, query) ||
+    productTextContains(product.productName, query)) {
+    return true;
+  }
+
+  return (Array.isArray(product.skus) ? product.skus : []).some((sku) => (
+    productTextContains(sku.skuCode, query) ||
+    productTextContains(sku.model, query) ||
+    productTextContains(sku.color, query) ||
+    productTextContains(sku.size, query)
+  ));
+}
+
+function productTextContains(value, query) {
+  return String(value || "").trim().toLowerCase().includes(query);
 }
 
 function renderShipmentView() {
@@ -2859,8 +2991,10 @@ async function loadShipments(options) {
 
   if (reset) {
     shipmentState.page = 1;
-    shipmentState.items = [];
-    shipmentState.hasMore = false;
+    if (shipmentState.listItems.length > 0) {
+      shipmentState.items = shipmentState.listItems;
+      shipmentState.hasMore = shipmentState.listHasMore;
+    }
     shipmentState.detail = null;
     shipmentState.detailError = "";
     shipmentState.actionError = "";
@@ -2889,6 +3023,8 @@ async function loadShipments(options) {
     const nextItems = Array.isArray(data.items) ? data.items : [];
     shipmentState.items = reset ? nextItems : appendUniqueShipments(shipmentState.items, nextItems);
     shipmentState.hasMore = !!data.hasMore;
+    shipmentState.listItems = shipmentState.items;
+    shipmentState.listHasMore = shipmentState.hasMore;
   } catch (error) {
     if (handleProductAuthFailure(error)) {
       return;
@@ -2929,7 +3065,7 @@ function updateShipmentDom() {
     shipmentDom.status.textContent = "ยังไม่มี Shipment";
     shipmentDom.status.dataset.type = "info";
   } else if (shipmentState.loading) {
-    shipmentDom.status.textContent = "กำลังโหลดเพิ่มเติม...";
+    shipmentDom.status.textContent = shipmentState.page === 1 ? "กำลังอัปเดตรายการล่าสุด..." : "กำลังโหลดเพิ่มเติม...";
     shipmentDom.status.dataset.type = "info";
   } else {
     shipmentDom.status.textContent = "";
@@ -2984,9 +3120,10 @@ function createShipmentCard(shipment) {
 }
 
 async function openShipmentDetail(shipment) {
+  const normalizedShipmentId = String(shipment.shipmentId || "").trim();
   shipmentState.listScrollTop = getProductScrollTop();
   shipmentState.detail = {
-    shipmentId: shipment.shipmentId,
+    shipmentId: normalizedShipmentId,
     reference: shipment.reference,
     status: shipment.status,
     itemCount: shipment.itemCount,
@@ -3009,10 +3146,10 @@ async function openShipmentDetail(shipment) {
   try {
     const response = await callAuthApi("getShipmentDetail", {
       sessionToken: requireSessionToken(),
-      shipmentId: shipment.shipmentId,
+      shipmentId: normalizedShipmentId,
     });
     const data = requireSuccess(response);
-    if (requestId !== shipmentState.detailRequestId) {
+    if (!isActiveShipmentDetailRequest(normalizedShipmentId, requestId)) {
       return;
     }
     shipmentState.detail = data;
@@ -3020,13 +3157,22 @@ async function openShipmentDetail(shipment) {
     if (handleProductAuthFailure(error)) {
       return;
     }
-    shipmentState.detailError = toShipmentErrorMessage(error);
+    if (isActiveShipmentDetailRequest(normalizedShipmentId, requestId)) {
+      shipmentState.detailError = toShipmentErrorMessage(error);
+    }
   } finally {
-    if (requestId === shipmentState.detailRequestId) {
+    if (isActiveShipmentDetailRequest(normalizedShipmentId, requestId)) {
       shipmentState.detailLoading = false;
       rerenderShipmentView();
     }
   }
+}
+
+function isActiveShipmentDetailRequest(shipmentId, requestId) {
+  return requestId === shipmentState.detailRequestId &&
+    shipmentState.detail &&
+    shipmentState.detailTransition !== "exit" &&
+    String(shipmentState.detail.shipmentId || "").trim() === String(shipmentId || "").trim();
 }
 
 function renderShipmentDetailView() {
@@ -3055,7 +3201,6 @@ function renderShipmentDetailView() {
   close.type = "button";
   close.textContent = "กลับ";
   close.disabled = shipmentState.detailTransition === "exit" ||
-    shipmentState.detailLoading ||
     !!shipmentState.actionSubmitting;
   close.addEventListener("click", closeShipmentDetail);
   header.append(titleWrap, close);
@@ -3985,6 +4130,7 @@ function renderShipmentSkuPicker() {
   });
   searchInput.addEventListener("input", (event) => {
     picker.query = event.target.value;
+    applyShipmentSkuPickerLocalPreview();
     scheduleShipmentSkuPickerSearch();
   });
   searchLabel.append(searchText, searchInput);
@@ -4162,8 +4308,63 @@ function updateShipmentSkuPickerDom() {
 function openShipmentSkuPicker() {
   shipmentCreateState.picker = createEmptyShipmentPickerState();
   shipmentCreateState.picker.open = true;
+  seedShipmentSkuPickerSnapshot();
   rerenderShipmentView();
   loadShipmentSkuPickerItems({ reset: true });
+}
+
+function seedShipmentSkuPickerSnapshot() {
+  const picker = shipmentCreateState.picker;
+  if (!picker.open) {
+    return;
+  }
+
+  const knownItems = productState.knownItems.length > 0 ? productState.knownItems : stockState.knownItems;
+  const listItems = productState.listItems.length > 0 ? productState.listItems : stockState.listItems;
+  const listHasMore = productState.listItems.length > 0 ? productState.listHasMore : stockState.listHasMore;
+
+  if (knownItems.length > 0) {
+    picker.knownItems = knownItems;
+  }
+
+  if (listItems.length > 0) {
+    picker.listItems = listItems;
+    picker.listHasMore = listHasMore;
+    picker.items = listItems;
+    picker.hasMore = listHasMore;
+  }
+}
+
+function applyShipmentSkuPickerLocalPreview() {
+  const picker = shipmentCreateState.picker;
+  if (!picker.open) {
+    return;
+  }
+
+  const query = picker.query.trim();
+  const knownItems = picker.knownItems.length > 0
+    ? picker.knownItems
+    : productState.knownItems.length > 0 ? productState.knownItems : stockState.knownItems;
+  if (query) {
+    picker.items = filterProductItemsByQuery(knownItems, query);
+    picker.hasMore = false;
+    picker.error = "";
+    updateShipmentSkuPickerDom();
+    return;
+  }
+
+  if (picker.listItems.length > 0) {
+    picker.items = picker.listItems;
+    picker.hasMore = picker.listHasMore;
+    picker.error = "";
+    updateShipmentSkuPickerDom();
+  } else if (productState.listItems.length > 0 || stockState.listItems.length > 0) {
+    const listItems = productState.listItems.length > 0 ? productState.listItems : stockState.listItems;
+    picker.items = listItems;
+    picker.hasMore = productState.listItems.length > 0 ? productState.listHasMore : stockState.listHasMore;
+    picker.error = "";
+    updateShipmentSkuPickerDom();
+  }
 }
 
 function closeShipmentSkuPicker() {
@@ -4195,17 +4396,17 @@ async function loadShipmentSkuPickerItems({ reset }) {
 
   const requestId = picker.requestId + 1;
   picker.requestId = requestId;
+  const query = picker.query.trim();
   if (reset) {
     picker.page = 1;
-    picker.hasMore = false;
-    picker.items = [];
+    applyShipmentSkuPickerLocalPreview();
   }
   picker.loading = true;
   picker.error = "";
   updateShipmentSkuPickerDom();
 
   try {
-    const action = picker.query.trim() ? "searchProducts" : "listProducts";
+    const action = query ? "searchProducts" : "listProducts";
     const payload = {
       sessionToken: requireSessionToken(),
       page: picker.page,
@@ -4213,23 +4414,38 @@ async function loadShipmentSkuPickerItems({ reset }) {
     };
 
     if (action === "searchProducts") {
-      payload.query = picker.query.trim();
+      payload.query = query;
     }
 
     const response = await callAuthApi(action, payload);
     const data = requireSuccess(response);
 
-    if (requestId !== shipmentCreateState.picker.requestId || !shipmentCreateState.picker.open) {
+    if (requestId !== shipmentCreateState.picker.requestId ||
+      !shipmentCreateState.picker.open ||
+      query !== shipmentCreateState.picker.query.trim()) {
       return;
     }
 
     const nextItems = Array.isArray(data.items) ? data.items : [];
+    shipmentCreateState.picker.knownItems = mergeProductSnapshots(shipmentCreateState.picker.knownItems, nextItems);
+    if (action === "listProducts") {
+      shipmentCreateState.picker.listItems = reset
+        ? nextItems
+        : appendUniqueProducts(shipmentCreateState.picker.listItems, nextItems);
+      shipmentCreateState.picker.listHasMore = !!data.hasMore;
+    }
     shipmentCreateState.picker.items = reset
       ? nextItems
       : appendUniqueProducts(shipmentCreateState.picker.items, nextItems);
     shipmentCreateState.picker.hasMore = !!data.hasMore;
   } catch (error) {
     if (handleProductAuthFailure(error)) {
+      return;
+    }
+
+    if (requestId !== shipmentCreateState.picker.requestId ||
+      !shipmentCreateState.picker.open ||
+      query !== shipmentCreateState.picker.query.trim()) {
       return;
     }
 
@@ -4464,6 +4680,8 @@ async function refreshShipmentListSnapshot() {
   });
   const data = requireSuccess(response);
   shipmentState.items = Array.isArray(data.items) ? data.items : [];
+  shipmentState.listItems = shipmentState.items;
+  shipmentState.listHasMore = !!data.hasMore;
   shipmentState.page = Math.max(1, Math.ceil(shipmentState.items.length / shipmentState.pageSize));
   shipmentState.hasMore = !!data.hasMore;
   shipmentState.initialized = true;
@@ -4498,6 +4716,11 @@ async function refreshStockAfterShipmentDispatch(items) {
   );
   const snapshot = await fetchStockRefreshSnapshot(token, stockState.query.trim(), requestedPageSize);
   stockState.items = snapshot.items;
+  if (!stockState.query.trim()) {
+    stockState.listItems = snapshot.items;
+    stockState.listHasMore = !!snapshot.hasMore;
+  }
+  stockState.knownItems = mergeProductSnapshots(stockState.knownItems, snapshot.items);
   stockState.page = Math.max(1, Math.ceil(stockState.items.length / stockState.pageSize));
   stockState.hasMore = !!snapshot.hasMore;
   stockState.error = "";
@@ -4505,11 +4728,11 @@ async function refreshStockAfterShipmentDispatch(items) {
 
 function closeShipmentDetail() {
   if (shipmentState.detailTransition === "exit" ||
-    shipmentState.detailLoading ||
     shipmentState.actionSubmitting) {
     return;
   }
 
+  shipmentState.detailRequestId += 1;
   const detailView = document.querySelector(".shipment-detail-view");
   const finish = () => {
     shipmentState.detail = null;
@@ -4588,6 +4811,9 @@ function createEmptyShipmentPickerState() {
     loading: false,
     error: "",
     items: [],
+    listItems: [],
+    listHasMore: false,
+    knownItems: [],
     selectedItems: {},
     requestId: 0,
   };
@@ -4847,6 +5073,7 @@ function renderStockView() {
   searchInput.value = stockState.query;
   searchInput.addEventListener("input", (event) => {
     stockState.query = event.target.value;
+    applyStockLocalSearchPreview();
     clearTimeout(stockSearchTimer);
     stockSearchTimer = setTimeout(() => {
       loadStock({ reset: true });
@@ -4905,11 +5132,11 @@ async function loadStock(options) {
   const reset = !!(options && options.reset);
   const requestId = stockState.requestId + 1;
   stockState.requestId = requestId;
+  const query = stockState.query.trim();
 
   if (reset) {
     stockState.page = 1;
-    stockState.items = [];
-    stockState.hasMore = false;
+    applyStockLocalSearchPreview();
     stockState.detail = null;
     stockState.history = [];
     stockState.historyError = "";
@@ -4923,7 +5150,7 @@ async function loadStock(options) {
 
   try {
     const token = requireSessionToken();
-    const action = stockState.query.trim() ? "searchProducts" : "listProducts";
+    const action = query ? "searchProducts" : "listProducts";
     const payload = {
       sessionToken: token,
       page: stockState.page,
@@ -4931,21 +5158,30 @@ async function loadStock(options) {
     };
 
     if (action === "searchProducts") {
-      payload.query = stockState.query.trim();
+      payload.query = query;
     }
 
     const response = await callAuthApi(action, payload);
     const data = requireSuccess(response);
 
-    if (requestId !== stockState.requestId) {
+    if (requestId !== stockState.requestId || query !== stockState.query.trim()) {
       return;
     }
 
     const nextItems = Array.isArray(data.items) ? data.items : [];
+    stockState.knownItems = mergeProductSnapshots(stockState.knownItems, nextItems);
+    if (action === "listProducts") {
+      stockState.listItems = reset ? nextItems : appendUniqueProducts(stockState.listItems, nextItems);
+      stockState.listHasMore = !!data.hasMore;
+    }
     stockState.items = reset ? nextItems : appendUniqueProducts(stockState.items, nextItems);
     stockState.hasMore = !!data.hasMore;
   } catch (error) {
     if (handleProductAuthFailure(error)) {
+      return;
+    }
+
+    if (requestId !== stockState.requestId || query !== stockState.query.trim()) {
       return;
     }
 
@@ -4986,7 +5222,9 @@ function updateStockDom() {
       ? "ไม่พบสินค้าที่ตรงกับคำค้นหา"
       : "ยังไม่มีข้อมูล Stock";
   } else if (stockState.loading) {
-    stockDom.status.textContent = "กำลังโหลดเพิ่มเติม...";
+    stockDom.status.textContent = stockState.query.trim()
+      ? "แสดงผลจากข้อมูลในเครื่อง กำลังค้นหาจาก Backend..."
+      : stockState.page === 1 ? "กำลังอัปเดตรายการ Stock ล่าสุด..." : "กำลังโหลดเพิ่มเติม...";
   } else {
     stockDom.status.textContent = stockState.query.trim()
       ? "ผลการค้นหา Stock แบบอ่านอย่างเดียว"
@@ -5036,16 +5274,17 @@ function openStockDetail(item) {
 }
 
 async function loadStockHistory(skuCode, requestId) {
+  const normalizedSkuCode = normalizeSkuCodeForUi(skuCode);
   try {
     const response = await callAuthApi("getStockHistory", {
       sessionToken: requireSessionToken(),
-      skuCode,
+      skuCode: normalizedSkuCode,
       page: 1,
       pageSize: stockState.pageSize,
     });
     const data = requireSuccess(response);
 
-    if (requestId !== stockState.historyRequestId) {
+    if (!isActiveStockHistoryRequest(normalizedSkuCode, requestId)) {
       return;
     }
 
@@ -5055,13 +5294,22 @@ async function loadStockHistory(skuCode, requestId) {
       return;
     }
 
-    stockState.historyError = toThaiErrorMessage(error);
+    if (isActiveStockHistoryRequest(normalizedSkuCode, requestId)) {
+      stockState.historyError = toThaiErrorMessage(error);
+    }
   } finally {
-    if (requestId === stockState.historyRequestId) {
+    if (isActiveStockHistoryRequest(normalizedSkuCode, requestId)) {
       stockState.historyLoading = false;
       rerenderStockView();
     }
   }
+}
+
+function isActiveStockHistoryRequest(skuCode, requestId) {
+  return requestId === stockState.historyRequestId &&
+    stockState.detail &&
+    stockState.detailTransition !== "exit" &&
+    normalizeSkuCodeForUi(stockState.detail.skuCode) === normalizeSkuCodeForUi(skuCode);
 }
 
 function renderStockDetailView() {
@@ -5410,6 +5658,11 @@ async function refreshStockAfterMutation(skuCode) {
   }
 
   stockState.items = snapshot.items;
+  if (!stockState.query.trim()) {
+    stockState.listItems = snapshot.items;
+    stockState.listHasMore = !!snapshot.hasMore;
+  }
+  stockState.knownItems = mergeProductSnapshots(stockState.knownItems, snapshot.items);
   stockState.page = Math.max(1, Math.ceil(stockState.items.length / stockState.pageSize));
   stockState.hasMore = !!snapshot.hasMore;
   stockState.error = "";
@@ -5593,6 +5846,7 @@ function closeStockDetail() {
     return;
   }
 
+  stockState.historyRequestId += 1;
   const detailView = document.querySelector(".stock-detail-view");
   const finish = () => {
     stockState.detail = null;
