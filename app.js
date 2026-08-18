@@ -1396,6 +1396,9 @@ function resetProductEditState() {
 }
 
 function openProductEditCenter(product) {
+  productState.detailRequestId += 1;
+  productState.detailLoading = false;
+  productState.detailError = "";
   productEditState.original = createProductEditSnapshot(product);
   productEditState.form = createProductEditSnapshot(product);
   productEditState.mode = "form";
@@ -1936,7 +1939,25 @@ function cancelProductEditCenter() {
   }
 
   resetProductEditState();
+  if (renderProductDetailContentInPlace()) {
+    return;
+  }
   rerenderProductView();
+}
+
+function renderProductDetailContentInPlace() {
+  const detailView = document.querySelector(".product-detail-view");
+  if (!detailView || !productState.detail || activeViewName !== "products") {
+    return false;
+  }
+
+  const nextView = renderProductDetailView();
+  detailView.classList.remove("is-exiting");
+  clearElement(detailView);
+  while (nextView.firstChild) {
+    detailView.append(nextView.firstChild);
+  }
+  return true;
 }
 
 function validateProductEditForm() {
